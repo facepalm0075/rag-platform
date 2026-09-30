@@ -1,0 +1,191 @@
+{
+  "auth": "Authorization: Bearer <token> required on all endpoints marked auth:true",
+  "errors": {
+    "format": "All non-SSE errors are JSON: {error: '<message>'} (HTTP status carries the semantic). Internal 500s always return {error: 'Internal server error'} with the real detail logged server-side",
+    "common": [
+      { "status": 400, "error": "Invalid JSON body", "when": "Request body is malformed JSON (body-parser parse failure)" },
+      { "status": 401, "error": "Missing or invalid authorization header", "when": "No Authorization header or not a Bearer token (auth:true endpoints)" },
+      { "status": 401, "error": "Invalid or expired session", "when": "Bearer token does not match a live session (auth:true endpoints)" },
+      { "status": 404, "error": "Not found", "when": "Unknown route" },
+      { "status": 500, "error": "Internal server error", "when": "Unexpected server/DB/worker failure (details never exposed to the client)" }
+    ]
+  },
+  "endpoints": [
+    {
+      "method": "POST",
+      "path": "/api/auth/register",
+      "auth": false,
+      "body": { "username": "string 3-100", "password": "string 6-255" },
+      "returns": "{user, token} (201)",
+      "does": "Create user + session; seeds example conversation + 'Getting started guide' document (linked to that conversation) with precomputed embeddings. Response returns immediately; seeding finishes shortly after",
+      "errors": [
+        { "status": 400, "error": "Validation failed", "details": "{field errors}", "when": "Invalid payload" },
+        { "status": 409, "error": "Username already taken", "when": "Username already registered" }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/auth/login",
+      "auth": false,
+      "body": { "username": "string", "password": "string" },
+      "returns": "{user, token}",
+      "does": "Validate credentials, create session",
+      "errors": [
+        { "status": 400, "error": "Validation failed", "details": "{field errors}", "when": "Invalid payload" },
+        { "status": 401, "error": "Invalid credentials", "when": "Wrong password or unknown username" }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/auth/logout",
+      "auth": true,
+      "returns": "{success}",
+      "does": "Invalidate the session token"
+    },
+    {
+      "method": "GET",
+      "path": "/api/auth/me",
+      "auth": true,
+      "returns": "{user}",
+      "does": "Return current authenticated user",
+      "errors": [
+        { "status": 404, "error": "User not found", "when": "Session exists but the user row was deleted" }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/documents",
+      "auth": true,
+      "body": {
+        "title": "string 1-255",
+        "conversation_id": "uuid (the conversation this document belongs to; must be owned by the user)",
+        "source_type": "string 1-50 (optional)",
+        "metadata": "object (optional)",
+        "chunks": [
+          { "content": "string >=1", "chunk_index": "int >=0", "heading": "string <=255 (optional)", "metadata": "object (optional)" }
+        ]
+      },
+      "returns": "{document, chunks} (201)",
+      "does": "Ingest pre-chunked content for one conversation: embeds all chunks in batches via worker (or OpenAI fallback), stores in pgvector. Search for that conversation will only retrieve these chunks",
+      "errors": [
+        { "status": 400, "error": "Validation failed", "details": "{field errors}", "when": "Invalid payload" },
+        { "status": 404, "error": "Conversation not found", "when": "conversation_id does not exist or belongs to another user" }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/documents",
+      "auth": true,
+      "query": "limit (1-200, optional, default 50), offset (>=0, optional), conversation_id (uuid, optional filter)",
+      "returns": "{documents, total}",
+      "does": "List user's documents (newest first); filter to one conversation with ?conversation_id=",
+      "errors": [
+        { "status": 400, "error": "Validation failed", "details": "{field errors}", "when": "Invalid query params" }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/documents/:id",
+      "auth": true,
+      "query": "include_embeddings (boolean, optional, default false)",
+      "returns": "{document, chunks}",
+      "does": "Get one document with its chunks (scoped to user; stored 768-dim embedding vectors omitted unless include_embeddings=true)",
+      "errors": [
+        { "status": 400, "error": "Validation failed", "details": "{field errors}", "when": "Invalid query params" },
+        { "status": 404, "error": "Document not found", "when": "Document does not exist or belongs to another user" }
+      ]
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/documents/:id",
+      "auth": true,
+      "returns": "{success}",
+      "does": "Delete document + chunks via cascade (scoped to user)",
+      "errors": [
+        { "status": 404, "error": "Document not found", "when": "Document does not exist or belongs to another user" }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/conversations",
+      "auth": true,
+      "body": { "title": "string <=255 (optional, default 'New conversation')" },
+      "returns": "{conversation} (201)",
+      "does": "Create a new conversation",
+      "errors": [
+        { "status": 400, "error": "Validation failed", "details": "{field errors}", "when": "Invalid payload" }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/conversations",
+      "auth": true,
+      "query": "limit (1-200, optional, default 50), offset (>=0, optional)",
+      "returns": "{conversations, total}",
+      "does": "List user's conversations (updated_at DESC)",
+      "errors": [
+        { "status": 400, "error": "Validation failed", "details": "{field errors}", "when": "Invalid query params" }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/conversations/:id",
+      "auth": true,
+      "query": "from & to (optional ints, 1-based inclusive range, must come together, to >= from). Without them, returns the latest 100 messages",
+      "returns": "{conversation, messages, total}",
+      "does": "Get conversation with messages (range = e.g. ?from=1&to=10 for first 10; default: latest 100)",
+      "errors": [
+        { "status": 400, "error": "Validation failed", "details": "{field errors}", "when": "Invalid query params (e.g. from without to, or to < from)" },
+        { "status": 404, "error": "Conversation not found", "when": "Conversation does not exist or belongs to another user" }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/conversations/:id/chunks",
+      "auth": true,
+      "query": "limit (1-200, optional, default 50), offset (>=0, optional)",
+      "returns": "{conversation, chunks, total}",
+      "does": "Examine the conversation's knowledge base: every chunk of every document attached to this conversation (document_title, heading, content, chunk_index). Embedding vectors omitted",
+      "errors": [
+        { "status": 400, "error": "Validation failed", "details": "{field errors}", "when": "Invalid query params" },
+        { "status": 404, "error": "Conversation not found", "when": "Conversation does not exist or belongs to another user" }
+      ]
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/conversations/:id",
+      "auth": true,
+      "body": { "title": "string 1-255" },
+      "returns": "{conversation}",
+      "does": "Rename conversation (scoped to user)",
+      "errors": [
+        { "status": 400, "error": "Validation failed", "details": "{field errors}", "when": "Invalid payload" },
+        { "status": 404, "error": "Conversation not found", "when": "Conversation does not exist or belongs to another user" }
+      ]
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/conversations/:id",
+      "auth": true,
+      "returns": "{success}",
+      "does": "Delete conversation + messages (scoped to user). Documents attached to this conversation and their chunks are deleted via cascade",
+      "errors": [
+        { "status": 404, "error": "Conversation not found", "when": "Conversation does not exist or belongs to another user" }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/conversations/:id/messages",
+      "auth": true,
+      "body": { "content": "string >=1" },
+      "returns": "SSE: {type:'token',content} chunks, then {type:'done',content} or {type:'error',error}",
+      "does": "RAG answer streamed: embed question -> top-K vector search scoped to THIS conversation's documents -> prompt -> LLM stream (worker or fallback). Client aborting the connection stops streaming and aborts the worker",
+      "errors": [
+        { "status": 400, "error": "Validation failed", "details": "{field errors}", "when": "Invalid payload (before the stream starts)" },
+        { "status": 404, "error": "Conversation not found", "when": "Conversation does not exist or belongs to another user (before the stream starts)" },
+        { "event": "SSE {type:'error'}", "error": "Conversation not found", "when": "Conversation disappears mid-stream (safe ApiError message)" },
+        { "event": "SSE {type:'error'}", "error": "Streaming failed", "when": "Worker/LLM/embedding failure mid-stream (real detail only logged server-side)" }
+      ]
+    }
+  ]
+}

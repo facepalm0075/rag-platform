@@ -1,0 +1,239 @@
+{
+  "project": "RAG Backend",
+  "version": "1.3.0",
+  "description": "A Retrieval-Augmented Generation backend service utilizing a clean Controller-Service-Repository architecture. Integrates with an external, independently-hosted AI Worker via WebSocket for local LLM/embedding offloading, and falls back to external APIs when the worker is unavailable.",
+  "techStack": {
+    "runtime": "Node.js",
+    "language": "TypeScript",
+    "framework": "Express",
+    "websocket": "ws (Backend acts as WS server for external AI Workers)",
+    "database": "PostgreSQL + pgvector extension",
+    "dbDriver": "pg (raw SQL)",
+    "auth": "Token-based (random string stored in sessions table)",
+    "validation": "zod",
+    "runner": "tsx",
+    "testing": "vitest",
+    "streaming": "Server-Sent Events (SSE) for chat response streaming"
+  },
+  "architecture": {
+    "dataFlow": {
+      "ingestion": "Route → Controller (validates req) → DocumentService (orchestrates) → WorkerPool (RPC to external worker for embedding) → ChunkRepository (stores in pgvector)",
+      "query": "Route → Controller (SSE) → RagService → WorkerPool (embeds query via external worker) → ChunkRepository (vector search) → WorkerPool (streaming RPC for LLM generation → each token sent as SSE event) → Controller (ends SSE stream)",
+      "aiRouting": "WorkerPool acts as a WebSocket server waiting for external AI Workers to connect. When a task arrives, it sends an RPC command to the active worker. If no worker is connected, it falls back to configured external API keys."
+    },
+    "keyDesignDecisions": [
+      "Client is responsible for extracting text and chunking.",
+      "Clean Architecture (Simple): Strict separation between HTTP layer (Controllers), Business Logic (Services), and Data Access (Repositories).",
+      "External AI Worker: The actual LLM execution happens via a completely separate project running on a local PC, communicating with this backend over WebSocket.",
+      "Raw SQL with pg for vector queries, encapsulated entirely within the Repository layer to keep services database-agnostic."
+    ]
+  },
+  "databaseSchema": {
+    "extensions": ["vector"],
+    "notes": "Only 'vector' extension is created. gen_random_uuid() is built-in since PG 13, so uuid-ossp is unnecessary.",
+    "tables": {
+      "users": {
+        "columns": {
+          "id": "UUID PRIMARY KEY DEFAULT gen_random_uuid()",
+          "username": "VARCHAR(100) UNIQUE NOT NULL",
+          "password_hash": "VARCHAR(255) NOT NULL",
+          "created_at": "TIMESTAMPTZ DEFAULT NOW()",
+          "updated_at": "TIMESTAMPTZ DEFAULT NOW()"
+        }
+      },
+      "sessions": {
+        "columns": {
+          "id": "UUID PRIMARY KEY DEFAULT gen_random_uuid()",
+          "user_id": "UUID REFERENCES users(id) ON DELETE CASCADE",
+          "token": "VARCHAR(64) UNIQUE NOT NULL",
+          "created_at": "TIMESTAMPTZ DEFAULT NOW()",
+          "expires_at": "TIMESTAMPTZ NOT NULL"
+        },
+        "indexes": ["user_id", "token"]
+      },
+      "documents": {
+        "columns": {
+          "id": "UUID PRIMARY KEY DEFAULT gen_random_uuid()",
+          "user_id": "UUID REFERENCES users(id) ON DELETE CASCADE",
+          "title": "VARCHAR(255) NOT NULL",
+          "source_type": "VARCHAR(50)",
+          "metadata": "JSONB DEFAULT '{}'",
+          "created_at": "TIMESTAMPTZ DEFAULT NOW()"
+        },
+        "indexes": ["user_id"]
+      },
+      "chunks": {
+        "columns": {
+          "id": "UUID PRIMARY KEY DEFAULT gen_random_uuid()",
+          "document_id": "UUID REFERENCES documents(id) ON DELETE CASCADE",
+          "content": "TEXT NOT NULL",
+          "embedding": "VECTOR(768)",
+          "chunk_index": "INTEGER",
+          "heading": "VARCHAR(255) — optional heading provided by the client",
+          "metadata": "JSONB DEFAULT '{}'",
+          "created_at": "TIMESTAMPTZ DEFAULT NOW()"
+        },
+        "indexes": ["document_id", "embedding (IVFFlat index for cosine similarity)"]
+      },
+      "conversations": {
+        "columns": {
+          "id": "UUID PRIMARY KEY DEFAULT gen_random_uuid()",
+          "user_id": "UUID REFERENCES users(id) ON DELETE CASCADE",
+          "title": "VARCHAR(255) DEFAULT 'New conversation'",
+          "created_at": "TIMESTAMPTZ DEFAULT NOW()",
+          "updated_at": "TIMESTAMPTZ DEFAULT NOW()"
+        },
+        "indexes": ["user_id"]
+      },
+      "messages": {
+        "columns": {
+          "id": "UUID PRIMARY KEY DEFAULT gen_random_uuid()",
+          "conversation_id": "UUID REFERENCES conversations(id) ON DELETE CASCADE",
+          "role": "VARCHAR(10) NOT NULL CHECK (role IN ('user', 'assistant'))",
+          "content": "TEXT NOT NULL",
+          "created_at": "TIMESTAMPTZ DEFAULT NOW()"
+        },
+        "indexes": ["conversation_id"]
+      }
+    }
+  },
+  "apiEndpoints": {
+    "auth": {
+      "POST /api/auth/register": { "description": "Register a new user and create session", "body": "{ username, password }", "response": "{ user, token }" },
+      "POST /api/auth/login": { "description": "Login with credentials and create session", "body": "{ username, password }", "response": "{ user, token }" },
+      "POST /api/auth/logout": { "description": "Logout and invalidate session token", "auth": true, "response": "{ success }" },
+      "GET /api/auth/me": { "description": "Get current authenticated user", "auth": true, "response": "{ user }" }
+    },
+    "documents": {
+      "POST /api/documents": { "description": "Ingest a document with pre-chunked content", "auth": true, "body": "{ title, source_type, metadata, chunks: [{ content, chunk_index, metadata }] }", "response": "{ document, chunks }" },
+      "GET /api/documents": { "description": "List all documents for the user", "auth": true, "response": "{ documents }" },
+      "GET /api/documents/:id": { "description": "Get a document with its chunks", "auth": true, "response": "{ document, chunks }" },
+      "DELETE /api/documents/:id": { "description": "Delete a document and its chunks", "auth": true, "response": "{ success }" }
+    },
+    "conversations": {
+      "POST /api/conversations": { "description": "Create a new conversation", "auth": true, "body": "{ title? }", "response": "{ conversation }" },
+      "GET /api/conversations": { "description": "List all conversations for the user", "auth": true, "response": "{ conversations }" },
+      "GET /api/conversations/:id": { "description": "Get a conversation with its messages (optional query params from & to for a 1-based inclusive message range, e.g. ?from=1&to=10 for the first 10)", "auth": true, "response": "{ conversation, messages, total }" },
+      "DELETE /api/conversations/:id": { "description": "Delete a conversation", "auth": true, "response": "{ success }" },
+      "PATCH /api/conversations/:id": { "description": "Update conversation title", "auth": true, "body": "{ title }", "response": "{ conversation }" },
+      "POST /api/conversations/:id/messages": { "description": "Send a message and get RAG response as SSE stream", "auth": true, "body": "{ content }", "response": "text/event-stream: { type: 'token', content: string } chunks, then { type: 'done', content: string } or { type: 'error', error: string }" }
+    },
+    "admin": {
+      "GET /admin/login": { "description": "Render the admin sign-in HTML page" },
+      "POST /admin/login": { "description": "Validate ADMIN_USERNAME/ADMIN_PASSWORD from .env (timing-safe), set httpOnly cookie, redirect to /admin", "body": "application/x-www-form-urlencoded { username, password }" },
+      "GET /admin": { "description": "HTML system report: summary cards, level/category/search/date filters, paginated log table (50/page), query params level, category, search, from, to, page" },
+      "GET /admin/logout": { "description": "Invalidate the admin session cookie and redirect to /admin/login" }
+    }
+  },
+  "projectStructure": {
+    "filesOutsideSrc": [".env.example", ".gitignore"],
+    "src/": {
+      "index.ts": "Entry point — starts Express server and mounts WebSocket server",
+      "app.ts": "Express app setup, middleware, route mounting",
+      "config/": {
+        "index.ts": "Validates and exports environment variables (uses dotenv). FALLBACK_API_KEYS split into array."
+      },
+      "db/": {
+        "pool.ts": "pg Pool singleton",
+        "migrate.ts": "Migration runner script (uses fileURLToPath for ESM compat)",
+        "migrations/": "SQL files 000-015 (only 'vector' extension; 015 creates system_logs)"
+      },
+      "routes/": {
+        "auth.ts": "Maps auth endpoints with zod validation",
+        "documents.ts": "Maps document endpoints with zod validation",
+        "conversations.ts": "Maps conversation endpoints with zod validation",
+        "admin.ts": "Maps admin dashboard endpoints (login page, login POST, dashboard, logout)"
+      },
+      "controllers/": {
+        "auth.ts": "Parses requests, calls AuthService, sends HTTP responses",
+        "documents.ts": "Handles HTTP layer for document ingestion",
+        "conversations.ts": "Handles HTTP layer for chat interactions (sendMessage sets SSE headers and writes event stream)",
+        "admin.ts": "Renders the admin sign-in page and the HTML system report (summary cards, filters, paginated log table)"
+      },
+      "logging/": {
+        "index.ts": "log(level, message, meta?, category?) — console JSON output + best-effort fire-and-forget insert into system_logs; never blocks callers"
+      },
+      "services/": {
+        "auth.ts": "Business logic: bcrypt hashing, uuid token generation",
+        "workerPool.ts": "WebSocket server + RPC dispatch + OpenAI API fallback",
+        "exampleEmbeddings.ts": "Generates and stores example embeddings once (checks example_embeddings table first)",
+        "documents.ts": "Orchestrates chunk embedding via WorkerPool and storage",
+        "conversations.ts": "Manages chat history CRUD operations",
+        "rag.ts": "The RAG pipeline: embed query → vector search → build prompt → LLM call"
+      },
+      "repositories/": {
+        "user.ts": "Raw SQL: INSERT INTO users, SELECT * FROM users",
+        "session.ts": "Raw SQL: session CRUD (also joins user for auth lookup)",
+        "document.ts": "Raw SQL: document CRUD",
+        "chunk.ts": "Raw SQL: batch insert chunks with array of embeddings, vector similarity search (<=>)",
+        "conversation.ts": "Raw SQL: conversation CRUD",
+        "message.ts": "Raw SQL: message CRUD (also updates conversation.updated_at)",
+        "exampleEmbedding.ts": "Raw SQL: read/write the single example_embeddings row",
+        "systemLog.ts": "Raw SQL: insert system_logs row + filtered/paginated queries + counts"
+      },
+      "middleware/": {
+        "auth.ts": "Session token verification via Authorization Bearer header",
+        "adminAuth.ts": "Admin dashboard auth: timing-safe .env credential check, in-memory httpOnly cookie sessions, requireAdmin guard",
+        "error.ts": "Global Express error handler (returns 500); routes 4xx/5xx through the logging system",
+        "validate.ts": "zod schema validation wrapper (returns 400 on failure)"
+      },
+      "seed/": {
+        "exampleData.ts": "Shared example conversation title + example document chunks (single source of truth)"
+      },
+      "types/": {
+        "index.ts": "Shared TypeScript interfaces (User, Session, Document, Chunk, Conversation, Message, etc.)"
+      }
+    }
+  },
+  "environmentVariables": {
+    "PORT": "<number: The port the Express app runs on (default: 3001)>",
+    "DATABASE_URL": "<string: PostgreSQL connection URI (default: postgresql://localhost:5432/rag)>",
+    "WORKER_AUTH_SECRET": "<string: Shared secret expected in WS headers when AI worker connects (default: dev-secret)>",
+    "FALLBACK_API_KEYS": "<string: Comma-separated list of external API keys (e.g., OpenAI) — split into array by config>",
+    "FALLBACK_LLM_MODEL": "<string: Model identifier for external API fallback (default: gpt-4o-mini)>",
+    "FALLBACK_EMBEDDING_MODEL": "<string: Model identifier for external embedding API (default: text-embedding-3-small)>",
+    "TOP_K_CHUNKS": "<number: Number of top similar chunks to retrieve (default: 5)>",
+    "CORS_ORIGIN": "<string: Allowed frontend domain (default: http://localhost:5173)>",
+    "VECTOR_DIMENSION": "<number: Must match embedding model output, e.g., 768 (default: 768)>",
+    "SESSION_EXPIRY_DAYS": "<number: Days until session token expires (default: 30)>",
+    "ADMIN_USERNAME": "<string: Username for the /admin dashboard sign-in (default: admin)>",
+    "ADMIN_PASSWORD": "<string: Password for the /admin dashboard sign-in (default: changeme — set a strong one in .env)>"
+  },
+  "ragPipelineDetails": {
+    "embeddingDimension": 768,
+    "similarityMetric": "cosine distance (<=>)",
+    "topKChunks": 5,
+    "configurableVia": "TOP_K_CHUNKS env var",
+    "promptTemplate": "You are a helpful assistant. Use the following context to answer the user's question. If you cannot find the answer in the context, say so.\n\nContext:\n{context}\n\nConversation History:\n{history}\n\nUser Question: {question}\n\nAnswer:"
+  },
+  "deviationLog": [
+    "Removed 'uuid-ossp' extension from migrations — gen_random_uuid() is built-in in PostgreSQL 13+, no extension needed.",
+    "Added TOP_K_CHUNKS environment variable to make top-k configurable at runtime.",
+    "Added .env.example and .gitignore files outside src/ for better DX.",
+    "switched from import.meta.dirname to fileURLToPath for ESM compatibility across Node.js versions.",
+    "FALLBACK_API_KEYS config now splits comma-separated string into an array for safer usage.",
+    "POST /api/documents returns { document, chunks } instead of just { document } — the chunks are created during ingestion so they're returned immediately.",
+    "SessionRepository.findByToken joins users table to return username alongside session — avoids an extra query in auth middleware.",
+    "MessageRepository.createMessage also updates conversation.updated_at automatically.",
+    "POST /api/conversations/:id/messages now returns a text/event-stream with SSE events (type: 'token' for each delta, type: 'done' on completion, type: 'error' on failure) instead of a JSON body.",
+    "WorkerPool has rpcChatStream method for streaming LLM responses: for WS workers it sends { stream: true } in payload and expects deltas via { id, content, done }, for OpenAI fallback it uses stream: true and parses SSE chunks.",
+    "rag.ts has answerQuestionStream which accepts an onToken callback called for each token; the controller writes SSE events inside the callback.",
+    "New user registration now seeds an example conversation (titled 'Example conversation', empty messages) plus an example document ('Getting started guide') with 5 embedded chunks — users can immediately ask questions and get answers grounded in the example chunks. Seeding is best-effort: failures are logged and never fail registration.",
+    "searchSimilarChunks now accepts a userId and joins chunks to documents, scoping vector search to the authenticated user's documents (previously it searched ALL users' chunks globally). rag.ts looks up the conversation to get its user_id.",
+    "Example chunks are no longer embedded at registration time: src/seed/exampleData.ts is the single source of truth for example content. src/services/exampleEmbeddings.ts generates the vectors exactly once and stores them in the new example_embeddings table (migration 009): it is triggered on server startup and whenever a worker connects to the WorkerPool (via workerPool.onWorkerConnected), and skips generation if a row already exists. seedExample.ts reuses the stored row; if it is missing or its dimension mismatches VECTOR_DIMENSION it falls back to live embedding.",
+    "example_embeddings table: single-row JSONB store of the example embeddings (dimension, source, model, embeddings) — preferred over file-system storage so no extra file or generation script is needed.",
+    "Chunks now support an optional heading column (migration 010): client may send heading alongside content in POST /api/documents; rag.ts prepends the heading to the chunk content when building prompt context.",
+    "Authorization scoping fix: all by-id lookups now filter on user_id at the repository level. findConversationById/findDocumentById (GET), updateConversationTitle (PATCH), deleteConversationById/deleteDocumentById (DELETE) all take a userId, and rag.ts answerQuestion/answerQuestionStream verify conversation ownership before writing messages — closing cross-user read/delete/write leaks.",
+    "GET /api/conversations/:id supports an optional history scope via query params from & to (1-based inclusive range, e.g. ?from=1&to=10 = first 10 messages). Validated by validateQuery middleware (both must be present together, to >= from); the response now also includes total message count.",
+    "Chat streaming now supports client-initiated abort: when the client drops the SSE connection, the controller (via req 'close' + res.writableEnded + AbortController) stops writing tokens, and the abort signal propagates through rag.answerQuestionStream → workerPool.rpcChatStream. For WS workers the pool sends { type: 'abort', payload: { taskId } } to kill the LLM generation; for the OpenAI fallback it aborts the fetch with AbortController. The partial answer is NOT persisted on abort.",
+    "answerQuestionStream now persists the incomplete streamed answer: tokens are accumulated locally and if the stream ends with an error or abort (rpcChatStream rejects), the partial content is stored as a single assistant message before the error is rethrown. If no token arrived before the failure, nothing extra is persisted. Success path unchanged.",
+    "Added a logging system with an admin dashboard (migration 015, system_logs table). src/logging/index.ts exposes log(level, message, meta?, category?) which writes JSON to console AND persists a best-effort, fire-and-forget row to system_logs (level, category, message, user_id, username, meta JSONB); DB failures never block callers. Admin dashboard at /admin: sign-in page (GET/POST /admin/login) with credentials from ADMIN_USERNAME/ADMIN_PASSWORD env vars (timing-safe sha256 compare, httpOnly cookie session in-memory for 24h), /admin renders an HTML report with summary cards (totals, errors 24h, per-level counts), filters (level, category, search, from/to), pagination (50/page), and a log table; /admin/logout invalidates the session. All services are instrumented: auth (register/login/logout success + failure), documents (ingest success/failure, delete), conversations (create/delete, stream started/failed), worker pool (connect/disconnect/errors), server lifecycle, and the error handler now routes 4xx/5xx through the same logger (category 'http') with user context when available. Failed admin sign-ins are logged under category 'admin'.",
+    "Message windows fix (post-interruption cleanup): findMessagesWithTotal now orders ASC (chronological, offset counted from the start of history) to correctly satisfy from/to 1-based range queries, and the default 'latest 100 messages' case is served by the new findLatestMessagesWithTotal (DESC + reverse + window total).",
+    "SSE failure events no longer leak the raw worker/fallback error into the stream: non-ApiError failures send the generic { type: 'error', error: 'Streaming failed' } event and the real detail is only logged server-side (category 'conversations').",
+    "Test env hermeticity: src/config now skips dotenv (skips .env) when NODE_ENV=test so the developer's real .env (admin credentials, WORKER_AUTH_SECRET, FALLBACK_API_KEYS) can never leak into the test suite; tests get values exclusively from tests/setup.ts + defaults.",
+    "Restored .env.example (project file listed in projectStructure.filesOutsideSrc) with placeholder values matching the documented environment variables; the real .env remains gitignored."
+  ],
+  "externalDependencies": {
+    "aiWorker": "A completely separate Node.js project (not tracked in this repo) that runs on a local PC, runs Ollama locally, connects to this backend's WebSocket server using WORKER_AUTH_SECRET, and waits to process embedding/chat generation tasks. Expected WS message format: { id, type: 'embed'|'chat', payload }. Expected response: { id, success, data?, error? }. Aborts: the backend sends { id, type: 'abort', payload: { taskId } } to cancel an in-flight streaming chat; the worker should stop the local LLM generation for taskId and send nothing in return."
+  }
+}

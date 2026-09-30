@@ -1,0 +1,20 @@
+{
+  "app": {
+    "name": "RAG Studio",
+    "tagline": "A retrieval-augmented assistant, built end-to-end.",
+    "description": "An interactive RAG playground showcasing embeddings, chunking, vector search, retrieval, and LLM orchestration.",
+    "storagePrefix": "rag"
+  },
+  "api": {
+    "baseUrl": "https://rag-server.pouyaprogramming.ir"
+  },
+  "chunking": {
+    "minChars": 800,
+    "maxChars": 1500
+  },
+  "chat": {
+    "pageSize": 12,
+    "scrollLoadThresholdPx": 200,
+    "inputPlaceholder": "Ask a question…"
+  }
+}
